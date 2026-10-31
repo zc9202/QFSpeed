@@ -296,9 +296,10 @@ final class FloatingWindowManager {
         let controller = OverlayHostController(store: store, provider: provider, layout: layout)
         w.rootViewController = controller
         w.isHidden = false
-        // 不要 makeKeyAndVisible：在 SpringBoard 进程里会把系统 key window
-        // 抢过来，可能导致状态栏/控制中心等系统 UI 行为异常。
-        // 只设 isHidden = false 就足够显示。
+        // 关键：显式逼一次布局。只把 isHidden 设成 false 不会立刻算 bounds，
+        // 此时 relayout() 读到 0x0 会把浮条位置定死在原点。
+        // 2.1.6 的 Tweak.xm 在 window.hidden = NO 之后同样紧跟一句 [window layoutIfNeeded]。
+        w.layoutIfNeeded()
 
         w.onLayout = { [weak self] in
             guard let self else { return }
@@ -310,13 +311,17 @@ final class FloatingWindowManager {
         // 不托管：App 形态托管只会把窗口交给 SpringBoard 接管，
         // 而 SpringBoard 不会合成 App 沙箱里的 surface —— 等于把还能正常显示的窗口弄没。
         // 跨 App 常驻由注入 SpringBoard 的 dylib 承担，那条路才真的在系统层。
-        NSLog("[QFSpeed] scene 窗口已就位（App 内可用；跨 App 常驻请用 SpringBoard 注入）")
-
         host = controller
         window = w
         retryCount = 0
         relayout()
         syncHitRegion()
+
+        // 自证日志：一行说清窗口到底有没有真的上屏。
+        // 注意 App 沙箱写不了 /var/mobile/Library/Logs，只能在控制台看到，
+        // 所以真正的现场自证放在主界面的「浮窗诊断」卡片里。
+        NSLog("[QFSpeed] scene 窗口就位 bounds=\(w.bounds.size) hidden=\(w.isHidden) "
+              + "level=\(w.windowLevel.rawValue) barCenter=\(layout.barCenter) visible=\(store.isVisible)")
     }
 
     // MARK: 定位
@@ -324,7 +329,11 @@ final class FloatingWindowManager {
     /// 当前 window 尺寸。SwiftUI 侧不要用自己的 geo.size ——
     /// 一旦它与 window.bounds 有偏差（安全区 / 分屏），归一化锚点就会漂。
     var currentBounds: CGSize {
-        window?.bounds.size ?? .zero
+        let b = window?.bounds.size ?? .zero
+        // 窗口刚建、还没布局时 bounds 是 0；这里同样用屏幕尺寸兜底，
+        // 否则命中区域会算成 0 宽，浮条「看得见点不到」。
+        if b.width < 1 || b.height < 1 { return UIScreen.main.bounds.size }
+        return b
     }
 
     /// 悬浮条 frame（window 坐标）
@@ -340,9 +349,30 @@ final class FloatingWindowManager {
 
     /// 按 store.anchor + peekSide 重算 layout.barCenter
     func relayout() {
-        guard let window else { return }
-        let b = window.bounds
-        guard b.width > 0, b.height > 0 else { return }
+        guard let window else {
+            // 窗口还没建出来（OverlayRootView 的 onAppear 早于 show()）。
+            // 这里先落一个屏幕内的初始位置，别让 SwiftUI 卡在 .zero 上等 ——
+            // 它和下面的命中区域必须用同一个坐标来源，否则会出现「看得见点不到」。
+            if layout.barCenter == .zero {
+                let s = UIScreen.main.bounds.size
+                if s.width > 1 {
+                    layout.barCenter = CGPoint(x: s.width / 2, y: s.height * 0.12)
+                }
+            }
+            return
+        }
+        // ⚠️ 这里是「浮窗完全不显示」的真正死结，别再改回去：
+        // 窗口刚建出来、还没 layoutIfNeeded 时 window.bounds 可能是 (0,0,0,0)。
+        // 一旦在这里 return，layout.barCenter 就永远停在 .zero，
+        // 而 SwiftUI 侧以「barCenter 有效」为渲染前提 —— 于是浮条一辈子不渲染，
+        // 整个窗口看着就是「空的 / 没显示」，面板也没有宿主可挂。
+        // 2.1.6 的 Tweak.xm 用的是同一套兜底：window.bounds 不可用时取 UIScreen.main.bounds。
+        var b = window.bounds
+        if b.width < 1 || b.height < 1 {
+            b = UIScreen.main.bounds
+            NSLog("[QFSpeed] window.bounds 不可用，改用 UIScreen 兜底 \(b.size)")
+        }
+        guard b.width > 1, b.height > 1 else { return }
 
         let size = barSize
         var cx: CGFloat
@@ -462,8 +492,9 @@ final class FloatingWindowManager {
             if layout.peekSide == .left {
                 regions.append(CGRect(x: 0, y: f.minY, width: max(f.maxX, edgePeek + 8), height: f.height))
             } else if layout.peekSide == .right {
-                let x = min(f.minX, window.bounds.width - edgePeek - 8)
-                regions.append(CGRect(x: x, y: f.minY, width: window.bounds.width - x, height: f.height))
+                let width = currentBounds.width
+                let x = min(f.minX, width - edgePeek - 8)
+                regions.append(CGRect(x: x, y: f.minY, width: width - x, height: f.height))
             } else {
                 regions.append(f)
             }
@@ -491,6 +522,34 @@ final class FloatingWindowManager {
         barSize = size
         relayout()
         syncHitRegion()
+    }
+
+    // MARK: 现场自证
+
+    /// 把「窗口到底有没有真的上屏」摊到主界面上。
+    ///
+    /// 为什么必须做成界面元素：App 沙箱写不了 /var/mobile/Library/Logs，
+    /// NSLog 只进控制台，而控制台在没有 Mac 的情况下根本看不到。
+    /// 之前几轮全靠猜日志，浪费了太多时间 —— 现在一眼看齐所有关键状态。
+    var diagnostics: [(String, String)] {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let active = scenes.first { $0.activationState == .foregroundActive }
+        var rows: [(String, String)] = []
+
+        if let w = window {
+            rows.append(("窗口", "已创建"))
+            rows.append(("bounds", "\(Int(w.bounds.width))×\(Int(w.bounds.height))"))
+            rows.append(("hidden / level", "\(w.isHidden ? 1 : 0) / \(Int(w.windowLevel.rawValue))"))
+            rows.append(("命中区域", "\(w.interactiveRegions.count) 块"))
+        } else {
+            rows.append(("窗口", "未创建"))
+        }
+        rows.append(("浮条中心", "\(Int(layout.barCenter.x)), \(Int(layout.barCenter.y))"))
+        rows.append(("浮条尺寸", "\(Int(barSize.width))×\(Int(barSize.height))"))
+        rows.append(("scene", "\(scenes.count) 个 / \(active != nil ? "active" : "无 active")"))
+        rows.append(("开关", store.isVisible ? "开" : "关"))
+        rows.append(("运行形态", SpringBoardWindowHost.shared.wasInjected ? "SpringBoard 注入" : "独立 App"))
+        return rows
     }
 }
 

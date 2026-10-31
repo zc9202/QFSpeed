@@ -35,7 +35,11 @@ struct OverlayRootView: View {
                     .contentShape(Rectangle())
                     .allowsHitTesting(false)
 
-                if store.isVisible && layout.barCenter != .zero {
+                // 渲染前提只看开关。位置由 relayout() 保证有效。
+                // 以前这里还多一个 barCenter != .zero 的
+                // 隐式条件：窗口刚建出来、 bounds 还是 0 时，
+                // 它永远为假 —— 浮条一辈子不渲染。
+                if store.isVisible {
                     bar
                         .position(
                             x: layout.barCenter.x + dragTranslation.width,

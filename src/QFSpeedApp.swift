@@ -59,6 +59,7 @@ struct DemoHostView: View {
                         .foregroundStyle(Color.white.opacity(0.5))
 
                     statusCard
+                    diagCard
                     controlsCard
                     notesCard
                 }
@@ -84,6 +85,35 @@ struct DemoHostView: View {
             row("显示项目", "\(store.visibleMetrics.count) / \(MetricKind.allCases.count)",
                 color: .white.opacity(0.8))
             row("运行时长", "\(tick) s", color: .white.opacity(0.8))
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(cardBackground)
+    }
+
+    /// 现场自证卡片：不用找日志，打开 App 就能看到浮窗到底走到哪一步。
+    /// 之前几轮「不显示」全靠猜，是因为 App 沙箱写不了系统日志目录。
+    private var diagRows: [(String, String)] {
+        FloatingWindowManager.shared.diagnostics
+    }
+
+    private var diagCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("浮窗诊断（实时）", systemImage: "stethoscope")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.5))
+
+            ForEach(diagRows.indices, id: \.self) { index in
+                HStack(spacing: 8) {
+                    Text(diagRows[index].0)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Color.white.opacity(0.55))
+                    Spacer(minLength: 8)
+                    Text(diagRows[index].1)
+                        .font(.system(size: 12.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Color.white.opacity(0.85))
+                }
+            }
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
