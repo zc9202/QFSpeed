@@ -220,7 +220,14 @@ final class FloatingWindowManager {
 
     private func activeScene() -> UIWindowScene? {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) {
+            return active
+        }
+        if let any = scenes.first { return any }
+        // 兜底：本包 Info.plist 里没有 UIApplicationSceneManifest，
+        // 某些系统版本上 connectedScenes 会滞后一拍（启动早期为空）。
+        // 这时从已经挂在屏幕上的窗口反查，比干等更可靠。
+        return UIApplication.shared.windows.compactMap { $0.windowScene }.first
     }
 
     /// 不依赖 UIWindowScene 的建窗路径，专供 SpringBoard 注入使用。
@@ -246,9 +253,9 @@ final class FloatingWindowManager {
         let controller = OverlayHostController(store: store, provider: provider, layout: layout)
         w.rootViewController = controller
         w.isHidden = false
-        // 不要 makeKeyAndVisible：在 SpringBoard 进程里会把系统 key window
-        // 抢过来，可能导致状态栏/控制中心等系统 UI 行为异常。
-        // 只设 isHidden = false 就足够显示。
+        // 同样要显式逼一次布局，理由同 buildWindow(scene:)：
+        // 不这么干 bounds 可能一直是 0，浮条位置会被定死在原点。
+        w.layoutIfNeeded()
 
         w.onLayout = { [weak self] in
             guard let self else { return }
@@ -257,17 +264,19 @@ final class FloatingWindowManager {
             self.syncHitRegion()
         }
 
-        // 注入进 SpringBoard 时，窗口本来就在系统 UI 层，自己托管给自己没有意义，
-        // 反而会把已经正常的 CAContext 再注册一次，容易把窗口弄没。
-        // 只有独立 App 形态才需要借 SpringBoard 托管来跨 App 显示。
-        let hosted: Bool
-        if SpringBoardWindowHost.shared.wasInjected {
-            hosted = false
-            NSLog("[QFSpeed] 注入模式：窗口直接挂在 SpringBoard 上，跳过托管")
-        } else {
-            hosted = SpringBoardWindowHost.shared.host(w)
-            NSLog("[QFSpeed] 无 scene 建窗，SpringBoard 托管: \(hosted)")
-        }
+        // 一律不做 SpringBoard 托管 —— 这是被真机日志证死过的一条死路。
+        //
+        // 2.1.6 的原话（QFOverlay.log）：
+        //   「窗口已交给 SpringBoard 合成 ctx=3565695019 level=10000000 secure=0 注册=成功」
+        //   「窗口自检 hidden=0 alpha=1.00 子层=1 条=239x22 barAlpha=1.00」
+        // 注册成功、层级够高、透明度正常，屏幕上什么都没有。
+        // 因为 CAContext 注册只是通知 SpringBoard「存在这个窗口」，
+        // 它并不会去合成一个属于 App 沙箱的 surface。
+        // 更糟的是：一旦托管，本来还能正常显示的窗口会被接走，再也回不来。
+        //
+        // 真正跨 App 常驻只有一条路 —— 窗口生在 SpringBoard 进程内（2.1.6 的 QFSpringBoard）。
+        // App 形态老老实实做本 App 内的显示 + 拖动 + 面板，不在这里硬凑。
+        NSLog("[QFSpeed] 无 scene 建窗：不做托管，直接按普通窗口显示")
 
         host = controller
         window = w
