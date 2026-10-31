@@ -246,10 +246,9 @@ final class PiPBarHost: NSObject {
 
         // 缩放策略：等比放大到几乎占满画布（PiP 窗口本身很小，字必须够大才看得清）
         let s = min(canvasWidth * 0.94 / size.width,
-                    canvasHeight * 0.78 / size.height,
+                    canvasHeight * 0.72 / size.height,
                     6.0)
         host.view.bounds = CGRect(origin: .zero, size: size)
-        host.view.transform = CGAffineTransform(scaleX: s, y: s)
         host.view.setNeedsLayout()
         host.view.layoutIfNeeded()
 
@@ -259,11 +258,14 @@ final class PiPBarHost: NSObject {
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: canvasWidth, height: canvasHeight),
                                                format: format)
         let image = renderer.image { ctx in
+            let cg = ctx.cgContext
             UIColor.black.setFill()
             ctx.fill(CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight))
-            ctx.cgContext.translateBy(x: canvasWidth / 2, y: canvasHeight / 2)
-            ctx.cgContext.translateBy(x: -size.width / 2, y: -size.height / 2)
-            host.view.layer.render(in: ctx.cgContext)
+            // layer.render(in:) 不认 layer 自己的 transform，缩放只能压在 CTM 上
+            cg.translateBy(x: canvasWidth / 2, y: canvasHeight / 2)
+            cg.scaleBy(x: s, y: s)
+            cg.translateBy(x: -size.width / 2, y: -size.height / 2)
+            host.view.layer.render(in: cg)
         }
         return image.cgImage
     }
@@ -335,7 +337,10 @@ final class PiPBarHost: NSObject {
     private func startAudioKeepAlive() {
         guard keepAlivePlayer == nil else { return }
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [])
+            // mixWithOthers 是必须的：不加就会把用户正在听的音乐顶掉。
+            // 混音下静音循环同样能让会话保持 active，够 PiP 续命。
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback,
+                                                           options: [.mixWithOthers])
             try AVAudioSession.sharedInstance().setActive(true)
             let url = try Self.silentWavURL()
             let player = try AVAudioPlayer(contentsOf: url)
