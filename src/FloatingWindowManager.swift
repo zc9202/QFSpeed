@@ -146,16 +146,38 @@ final class FloatingWindowManager {
     // MARK: 生命周期
 
     func show() {
-        // 常驻显示的核心：始终用「无 scene 窗口 + SpringBoard 托管」。
-        //  - 交给 SpringBoard 合成后，退后台 / 切 App / 锁屏都仍可见（系统级窗口）。
-        //  - 触摸走 App 自身的 UIApplication 事件循环，全屏可拖可点（全局拖动）。
-        // 思路对齐 2.1.6 的 -hud 子进程：不依赖 UIWindowScene，自建系统窗口交给 SpringBoard。
+        // 两条建窗路径，按运行形态选：
+        //   ① 有 UIWindowScene（App 自己在前台）→ 绑 scene 建窗。
+        //      这是唯一能保证「显示 + 触摸」都走系统标准路径的方式：
+        //      UIKit 的事件派发、布局、旋转、安全区全都由 scene 驱动。
+        //      ——之前把这条砍掉、一律走无 scene，结果就是窗口建出来了却收不到触摸，
+        //        设置面板点不开。
+        //   ② 没有 scene（注入进 SpringBoard）→ 无 scene 建窗 + 直接挂系统层。
         let screen = UIScreen.main.bounds
         guard screen.width > 0 else {
             scheduleRetry()
             return
         }
-        if window == nil { buildWindowWithoutScene() }
+        if window == nil {
+            if SpringBoardWindowHost.shared.wasInjected {
+                // 注入进 SpringBoard 时不能绑宿主 scene —— 那会把浮条变成
+                // SpringBoard 自己的普通子窗口，跟着系统 UI 一起被前后台切换掉。
+                buildWindowWithoutScene()
+                NSLog("[QFSpeed] 无 scene 建窗（注入/SpringBoard 路径）")
+            } else if let scene = activeScene() {
+                buildWindow(scene: scene)
+                NSLog("[QFSpeed] 用 scene 建窗（显示与触摸走系统标准路径）")
+            } else if retryCount < 25 {
+                // App 形态下 scene 一定会来（系统保证），只是启动早期还没就绪。
+                // 这时候绝不能退化成无 scene 窗口 —— 窗口一旦建出来就再也不会重建，
+                // 结果就是「显示不出来、面板也点不开」，而且后面 scene 就绪了也救不回来。
+                scheduleRetry()
+                return
+            } else {
+                buildWindowWithoutScene()
+                NSLog("[QFSpeed] 等 scene 超时，退化到无 scene 建窗")
+            }
+        }
         window?.isHidden = false
         store.isVisible = true
         layout.peekSide = .none
@@ -255,16 +277,19 @@ final class FloatingWindowManager {
     }
 
     private func buildWindow(scene: UIWindowScene) {
-        WindowPrivateOverrides.install()
+        // 这里刻意不装 `_isSystemWindow`。
+        // 在 App 进程里把自家窗口自称「系统窗口」，SpringBoard 会来接管这个 CAContext，
+        // 但它并不会真的合成一个属于 App 沙箱的 surface —— 结果就是
+        // hidden=0、alpha=1、注册返回成功，屏幕上什么都没有。
+        // App 形态就老老实实当普通窗口用：显示、拖动、面板全都走系统标准路径。
+        // 真正的系统级常驻走另一个入口（注入 SpringBoard 的 dylib）。
 
         let w = PassThroughWindow(windowScene: scene)
 
-        // 层级选择：
-        //  - 有了 platform-application + 越权签名时，用层级 10000000 能压在
-        //    绝大多数系统 UI 之上；但如果盖住 SpringBoard 的权限弹窗，
-        //    用户点不到「允许」就会把自己锁死。
-        //  - 普通签名（自签/TrollStore 未越权）时这个层级系统直接不理你。
-        w.windowLevel = UIWindow.Level(rawValue: 10_000_000)
+        // 绑了 scene 的窗口活在本 App 进程内，层级用 alert+1 就够（盖住自家 UI），
+        // 再高会把系统权限弹窗压到下面 —— 用户点不到「允许」就把自己锁死了。
+        // 真正跨 App 的层级由托管时的 atLevel 参数决定，不靠这个值。
+        w.windowLevel = UIWindow.Level.alert + 1
         w.backgroundColor = .clear
         w.isOpaque = false
 
@@ -282,15 +307,14 @@ final class FloatingWindowManager {
             self.syncHitRegion()
         }
 
-        // 关键：尝试把窗口托管给 SpringBoard。
-        // 成功 → 本 App 进后台 / 用户切到别的 App，浮窗照样显示（系统级）。
-        // 失败 → 保持普通 UIWindow，只在本 App 内可见。
-        // 无论成败都不影响功能，只是可见范围不同，所以不阻断流程。
-        let hosted = SpringBoardWindowHost.shared.host(w)
-        NSLog("[QFSpeed] SpringBoard 托管: \(hosted ? "成功（系统级）" : "失败（仅本 App）")")
+        // 不托管：App 形态托管只会把窗口交给 SpringBoard 接管，
+        // 而 SpringBoard 不会合成 App 沙箱里的 surface —— 等于把还能正常显示的窗口弄没。
+        // 跨 App 常驻由注入 SpringBoard 的 dylib 承担，那条路才真的在系统层。
+        NSLog("[QFSpeed] scene 窗口已就位（App 内可用；跨 App 常驻请用 SpringBoard 注入）")
 
         host = controller
         window = w
+        retryCount = 0
         relayout()
         syncHitRegion()
     }
