@@ -68,8 +68,12 @@ import io, os, sys, tarfile, gzip, struct
 
 pkg, out = sys.argv[1], sys.argv[2]
 
-def build_tar(root, out_path):
-    """把 root 下的树打成 tar.gz，保留权限位。"""
+def build_tar(root, out_path, exclude=()):
+    """把 root 下的树打成 tar.gz，保留权限位。
+
+    exclude 用来剔除不该进这个包的东西：data.tar 里绝不能有 DEBIAN/，
+    也不能把打包过程中生成的 control.tar.gz / data.tar.gz 自己裹进去。
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode='w') as tf:
         entries = []
@@ -78,6 +82,9 @@ def build_tar(root, out_path):
                 entries.append(os.path.join(dirpath, n))
         for path in sorted(entries):
             arc = os.path.relpath(path, root)
+            head = arc.split(os.sep)[0]
+            if arc in exclude or head in exclude:
+                continue
             ti = tf.gettarinfo(path, arcname=arc)
             ti.uid = ti.gid = 0
             ti.uname = ti.gname = 'root'
@@ -89,7 +96,8 @@ def build_tar(root, out_path):
         gz.write(raw)
 
 build_tar(os.path.join(pkg, 'DEBIAN'), os.path.join(pkg, 'control.tar.gz'))
-build_tar(pkg, os.path.join(pkg, 'data.tar.gz'))
+build_tar(pkg, os.path.join(pkg, 'data.tar.gz'),
+          exclude=('DEBIAN', 'control.tar.gz', 'data.tar.gz'))
 
 def ar_member(name, data):
     hdr = b'!<arch>\n'
