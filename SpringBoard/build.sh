@@ -51,6 +51,11 @@ cp "QFSpeedOverlay.plist"      "$PKG/Library/MobileSubstrate/DynamicLibraries/"
 chmod 755 "$PKG/Library/MobileSubstrate/DynamicLibraries/QFSpeedOverlay.dylib"
 chmod 644 "$PKG/Library/MobileSubstrate/DynamicLibraries/QFSpeedOverlay.plist"
 
+# 依赖说明：
+#   不同越狱的注入框架不一样 —— palera1n rootful 常用 Substitute（提供 mobilesubstrate），
+#   rootless 常用 ElleKit（包名 ellekit）。用可选依赖把三种都覆盖，
+#   否则 Sileo 会因为「找不到 mobilesubstrate」直接拒绝安装。
+# 注意：control 文件本身不能写注释行（dpkg 不支持 #），字段必须干净。
 cat > "$PKG/DEBIAN/control" <<'CTRL'
 Package: com.qfspeed.overlay
 Name: QFSpeed Overlay
@@ -60,9 +65,6 @@ Description: QFSpeed 常驻浮窗 —— 全局拖动 + 跨 App 常驻（窗口�
 Maintainer: qfspeed
 Author: qfspeed
 Section: Tweaks
-# 不同越狱的注入框架不一样：palera1n rootful 常用 Substitute（提供 mobilesubstrate），
-# rootless 常用 ElleKit（包名 ellekit）。用可选依赖把三种都覆盖，
-# 否则 Sileo 会因为「找不到 mobilesubstrate」直接拒绝安装。
 Depends: mobilesubstrate | ellekit | substrate
 CTRL
 
