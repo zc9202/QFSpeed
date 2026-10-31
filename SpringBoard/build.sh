@@ -60,7 +60,10 @@ Description: QFSpeed 常驻浮窗 —— 全局拖动 + 跨 App 常驻（窗口�
 Maintainer: qfspeed
 Author: qfspeed
 Section: Tweaks
-Depends: mobilesubstrate
+# 不同越狱的注入框架不一样：palera1n rootful 常用 Substitute（提供 mobilesubstrate），
+# rootless 常用 ElleKit（包名 ellekit）。用可选依赖把三种都覆盖，
+# 否则 Sileo 会因为「找不到 mobilesubstrate」直接拒绝安装。
+Depends: mobilesubstrate | ellekit | substrate
 CTRL
 
 python3 - "$PKG" "$OUT/QFSpeedOverlay_2.1.6_iphoneos-arm64.deb" <<'PY'
