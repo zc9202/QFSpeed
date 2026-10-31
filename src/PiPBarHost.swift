@@ -54,6 +54,10 @@ final class PiPBarHost: NSObject {
     /// 用户明确关掉 PiP 后就不再自动拉起，否则关了又弹很烦
     private(set) var stopRequested = false
 
+    /// PiP 起/停时通知外部（FloatingWindowManager 用它把 App 内那层浮窗暂时藏起来，
+    /// 否则同一块屏上会出现两条一模一样的浮条）。
+    var onActiveChanged: ((Bool) -> Void)?
+
     private override init() { super.init() }
 
     // MARK: - 对外
@@ -71,7 +75,8 @@ final class PiPBarHost: NSObject {
         dirty = true
     }
 
-    /// 建渲染层 + 把静音音轨跑起来。这一步之后，用户按 Home 就该浮起来。
+    /// 建渲染层 + 把静音音轨跑起来，并**立即**在前台拉起画中画。
+    /// 拉起来以后切到任何 App 都留在那儿，回本 App 时系统自动收回。
     func prepare() {
         guard !SpringBoardWindowHost.shared.wasInjected else { return }
         if isPrepared {
@@ -89,16 +94,14 @@ final class PiPBarHost: NSObject {
             return
         }
 
-        // 渲染层必须真在视图层级里，且尺寸非零；1×1 最容易通过系统校验，
-        // 又完全看不见（原来用 2×2 黑点，角落会有一丝痕迹）。
-        let anchor = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
-        anchor.backgroundColor = .clear
-        anchor.isOpaque = false
+        // 渲染层必须真在视图层级里，且尺寸非零；2×2 是参考实现验证过能通过系统校验的尺寸。
+        let anchor = UIView(frame: CGRect(x: 0, y: 0, width: 2, height: 2))
+        anchor.backgroundColor = .black
         anchor.isUserInteractionEnabled = false
         host.addSubview(anchor)
 
         let layer = AVSampleBufferDisplayLayer()
-        layer.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+        layer.frame = anchor.bounds
         layer.videoGravity = .resizeAspect
         anchor.layer.addSublayer(layer)
 
@@ -139,7 +142,12 @@ final class PiPBarHost: NSObject {
         NSLog("[QFSpeed] 画中画常驻已准备")
     }
 
-    /// 主动浮起。用户按 Home 前会被 willResignActive 调到。
+    /// 主动浮起。会在 willResignActive（按 Home / 切 App，尚未挂起）时被调到。
+    ///
+    /// 失败的真实原因链（这次一并修了）：
+    ///   1. 没有后台音频 → 一退后台就被挂起，定时器和渲染全停，PiP 根本来不及启动；
+    ///   2. 音频会话没激活 → 系统认为「没有内容在播放」，直接拒绝 possible；
+    ///   3. 帧太稀（1fps）→ 渲染层没进 readyForDisplay，start 被 -1003 扇回来。
     func start() {
         stopRequested = false
         prepare()
@@ -192,7 +200,7 @@ final class PiPBarHost: NSObject {
     var statusText: String {
         if SpringBoardWindowHost.shared.wasInjected { return "系统级（注入 SpringBoard）" }
         if !isPrepared { return lastError ?? "未准备" }
-        if let c = pipController, c.isPictureInPictureActive { return "画中画常驻中" }
+        if let c = pipController, c.isPictureInPictureActive { return "画中画常驻中（可拖到任意位置）" }
         if let e = lastError { return e }
         return audioActive ? "已准备（切后台自动浮起）" : "已准备（音频未激活）"
     }
@@ -487,6 +495,7 @@ extension PiPBarHost: AVPictureInPictureControllerDelegate {
         isRunning = true
         lastError = nil
         startRetries = 0
+        onActiveChanged?(true)
         NSLog("[QFSpeed] 画中画已浮起（可拖到任意位置）")
     }
 
@@ -499,6 +508,7 @@ extension PiPBarHost: AVPictureInPictureControllerDelegate {
             stopRequested = true
             NSLog("[QFSpeed] 用户关闭了画中画")
         }
+        onActiveChanged?(false)
         NSLog("[QFSpeed] 画中画已收起（userClosed=\(userClosed)）")
     }
 

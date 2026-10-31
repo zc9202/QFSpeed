@@ -141,7 +141,18 @@ final class FloatingWindowManager {
     /// 吸附阈值
     let snapDistance: CGFloat = 14
 
-    private init() {}
+    private init() {
+        // 画中画在的时候把 App 内那层浮窗藏起来，否则同一块屏上会出现两条浮条。
+        // 画中画被收起（回前台自动收回 / 用户关掉）时再把 App 内那层恢复。
+        PiPBarHost.shared.onActiveChanged = { [weak self] active in
+            guard let self, let w = self.window else { return }
+            if active {
+                w.isHidden = true
+            } else if self.store.isVisible {
+                w.isHidden = false
+            }
+        }
+    }
 
     // MARK: 生命周期
 
@@ -188,8 +199,9 @@ final class FloatingWindowManager {
         // 跨 App 常驻：本 App 的 UIWindow 一进后台就失去合成权，这是物理限制，
         // 不是 bug。照 2.1.6 的 QFPiPBar 走画中画这条路 —— 系统自己合成 PiP 窗口，
         // 浮在任何 App 之上，而且用户能随手把它拖到屏幕任意位置（真正的全局拖动）。
-        // 这里只做「准备」：把渲染层挂进视图层级并开始喂帧，
-        // 真正浮起来由系统在 App 进后台时自动完成（canStartPictureInPictureAutomaticallyFromInline）。
+        //
+        // 关键在于 prepare() 必须把**后台音频**（静音轨 + 会话 active）跑起来：
+        // 没有它，App 一退后台立刻被挂起，定时器与渲染全停，画中画根本来不及启动。
         PiPBarHost.shared.prepare()
     }
 
