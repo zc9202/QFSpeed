@@ -234,8 +234,14 @@ final class PiPBarHost: NSObject {
                                         object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             guard SettingsStore.shared.isVisible, !self.stopRequested else { return }
-            NSLog("[QFSpeed] willResignActive → 尝试浮起画中画")
-            self.start()
+            // 防抖：下拉控制中心 / 来电条 / 系统弹窗也会发 willResignActive，
+            // 但 App 并没真的退到后台。等 0.45 秒再看一眼，还在前台就不惊动用户。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                guard UIApplication.shared.applicationState != .active else { return }
+                guard let c = self.pipController, !c.isPictureInPictureActive else { return }
+                NSLog("[QFSpeed] willResignActive → 尝试浮起画中画")
+                self.start()
+            }
         })
         // 彻底进后台再兜一次（自动浮起失败时用）
         observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification,
