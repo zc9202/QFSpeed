@@ -174,6 +174,7 @@ final class PiPBarHost: NSObject {
         feedTimer = nil
         anchorView?.removeFromSuperview()
         anchorView = nil
+        renderHost = nil
         displayLayer = nil
         pipController = nil
         isPrepared = false
@@ -225,9 +226,12 @@ final class PiPBarHost: NSObject {
         enqueue(buffer)
     }
 
+    private var renderHost: UIHostingController<FloatingBarView>?
+
     /// 把**同一个** FloatingBarView 渲染成位图：样式与 App 内同源，不可能跑偏。
     /// 用 UIHostingController 而不是 ImageRenderer —— 后者在 iOS 16 上有
     /// main-actor 隔离限制，前者对 16.4 起的所有系统都稳。
+    /// 宿主控制器复用：每秒新建一个 VC + view 会把主线程拖出掉帧。
     private func renderBarImage() -> CGImage? {
         let metrics = self.metrics.isEmpty ? SettingsStore.shared.visibleMetrics : self.metrics
         let bar = FloatingBarView(
@@ -239,8 +243,15 @@ final class PiPBarHost: NSObject {
             useMaterial: false   // 离屏渲染没有 backdrop 可模糊，会出一层平灰，反而不像
         )
 
-        let host = UIHostingController(rootView: bar)
-        host.view.backgroundColor = .clear
+        let host: UIHostingController<FloatingBarView>
+        if let h = renderHost {
+            h.rootView = bar
+            host = h
+        } else {
+            host = UIHostingController(rootView: bar)
+            host.view.backgroundColor = .clear
+            renderHost = host
+        }
         let size = host.sizeThatFits(in: CGSize(width: 4096, height: 4096))
         guard size.width > 1, size.height > 1 else { return nil }
 
@@ -248,9 +259,11 @@ final class PiPBarHost: NSObject {
         let s = min(canvasWidth * 0.94 / size.width,
                     canvasHeight * 0.72 / size.height,
                     6.0)
-        host.view.bounds = CGRect(origin: .zero, size: size)
-        host.view.setNeedsLayout()
-        host.view.layoutIfNeeded()
+        if host.view.bounds.size != size {
+            host.view.bounds = CGRect(origin: .zero, size: size)
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+        }
 
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = 2
