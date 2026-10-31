@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.dylib binary
+*.deb binary
+*.ipa binary

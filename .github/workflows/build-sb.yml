@@ -1,0 +1,57 @@
+name: Build SB Overlay
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'SpringBoard/**'
+      - '.github/workflows/build-sb.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 注意：macos-14 已被 GitHub 下架，指定它的 job 会被秒取消。用 macos-latest。
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: SpringBoard
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install ldid
+        run: brew install ldid || echo "ldid 装不上，会退回 codesign"
+
+      - name: Build dylib + deb
+        run: |
+          chmod +x build.sh
+          bash build.sh
+
+      - name: Verify
+        run: |
+          echo "=== 产物 ==="
+          ls -lh build/
+          echo "=== 架构 ==="
+          python3 - <<'PY'
+          d = open('build/QFSpeedOverlay.dylib','rb').read(8)
+          print("magic:", d[:4].hex(), "-> arm64" if d[:4]==b'\xcf\xfa\xed\xfe' else "-> 非 arm64")
+          PY
+          echo "=== 关键符号 ==="
+          python3 - <<'PY'
+          b = open('build/QFSpeedOverlay.dylib','rb').read()
+          for k in ["QFOverlayWindow","QFBarView","QFTouchHandler","QFOverlayLoad",
+                    "initWithWindowScene","notify_register_dispatch","QFMount"]:
+              print("  %-24s %s" % (k, "OK" if k.encode() in b else "MISSING"))
+          PY
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: QFSpeedOverlay-SB
+          path: |
+            SpringBoard/build/*.dylib
+            SpringBoard/build/*.deb
