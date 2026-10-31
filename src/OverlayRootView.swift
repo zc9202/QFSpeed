@@ -62,6 +62,15 @@ struct OverlayRootView: View {
                 provider.onUpdate = { snap in
                     // 这些值一秒变一次，不需要动画，避免整条闪烁
                     snapshot = snap
+                    // 同一份数据也推给画中画常驻层：切出本 App 后，系统合成的
+                    // PiP 窗口里画的是同一个 FloatingBarView，样式与这里逐像素一致。
+                    PiPBarHost.shared.update(
+                        metrics: store.visibleMetrics,
+                        snapshot: snap,
+                        fontSize: store.fontSize,
+                        useIcon: store.useIcon,
+                        backgroundOpacity: store.backgroundOpacity
+                    )
                 }
                 manager.relayout()
             }

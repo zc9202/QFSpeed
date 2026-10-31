@@ -40,6 +40,10 @@
 	<true/>
 	<key>MinimumOSVersion</key>
 	<string>16.4</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIRequiresFullScreen</key>

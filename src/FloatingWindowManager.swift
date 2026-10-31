@@ -184,6 +184,13 @@ final class FloatingWindowManager {
         provider.start()
         relayout()
         syncHitRegion()
+
+        // 跨 App 常驻：本 App 的 UIWindow 一进后台就失去合成权，这是物理限制，
+        // 不是 bug。照 2.1.6 的 QFPiPBar 走画中画这条路 —— 系统自己合成 PiP 窗口，
+        // 浮在任何 App 之上，而且用户能随手把它拖到屏幕任意位置（真正的全局拖动）。
+        // 这里只做「准备」：把渲染层挂进视图层级并开始喂帧，
+        // 真正浮起来由系统在 App 进后台时自动完成（canStartPictureInPictureAutomaticallyFromInline）。
+        PiPBarHost.shared.prepare()
     }
 
     func hide() {
@@ -191,6 +198,8 @@ final class FloatingWindowManager {
         window?.isHidden = true
         provider.stop()
         syncHitRegion()
+        // 用户主动隐藏时把常驻那张也收掉，否则「隐藏」等于没隐藏。
+        PiPBarHost.shared.stop()
     }
 
     func toggle() {
@@ -558,6 +567,8 @@ final class FloatingWindowManager {
         rows.append(("scene", "\(scenes.count) 个 / \(active != nil ? "active" : "无 active")"))
         rows.append(("开关", store.isVisible ? "开" : "关"))
         rows.append(("运行形态", SpringBoardWindowHost.shared.wasInjected ? "SpringBoard 注入" : "独立 App"))
+        // 常驻那一层是否真的准备好了（画中画）。这一行是排查「切出去条子就没了」的关键。
+        rows.append(("常驻", PiPBarHost.shared.statusText))
         return rows
     }
 }

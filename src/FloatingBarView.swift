@@ -11,6 +11,10 @@ struct FloatingBarView: View {
     let fontSize: CGFloat
     let useIcon: Bool
     let backgroundOpacity: Double
+    /// 画中画常驻层用 false：ImageRenderer 渲染时没有背景可模糊，
+    /// ultraThinMaterial 会出一层平灰色，反而和 App 内的样子不一样。
+    /// App 内保持 true，样式一点不变。
+    var useMaterial: Bool = true
 
     var body: some View {
         HStack(spacing: fontSize * 0.38) {
@@ -80,8 +84,10 @@ struct FloatingBarView: View {
 
     private var background: some View {
         ZStack {
-            Capsule(style: .continuous)
-                .fill(.ultraThinMaterial)
+            if useMaterial {
+                Capsule(style: .continuous)
+                    .fill(.ultraThinMaterial)
+            }
             Capsule(style: .continuous)
                 .fill(Color.black.opacity(backgroundOpacity))
         }
