@@ -1,6 +1,7 @@
 import UIKit
 import SwiftUI
 import Combine
+import ObjectiveC
 
 // MARK: - 布局状态
 
@@ -59,6 +60,48 @@ final class PassThroughWindow: UIWindow {
         let inside = interactiveRegions.contains { $0.insetBy(dx: -margin, dy: -margin).contains(point) }
         guard inside else { return nil }
         return super.hitTest(point, with: event)
+    }
+}
+
+// MARK: - 私有窗口方法的运行时覆写
+
+/// Swift 编译期看不到 UIKit 的私有方法，`override` 直接编译不过，只能用运行时补。
+///
+/// 这几个方法是「窗口到底能不能被 SpringBoard 合成」的总开关。
+/// 2.1.6 的 QFHudWindow 里明确写了：「自报系统窗口，并声明 CAContext 由自己管 ——
+/// 两个条件缺一个，SpringBoard 就不会合成它」。
+/// 缺了它们表现就是：窗口 hidden=0、alpha=1、ctx 注册返回成功，
+/// 但屏幕上什么都没有，而且全程不报错。
+private enum WindowPrivateOverrides {
+
+    private typealias BoolIMP = @convention(c) (AnyObject, Selector) -> Bool
+
+    static func install() {
+        let cls: AnyClass = PassThroughWindow.self
+        // 自报「我是系统窗口」，否则 SpringBoard 不接这个 CAContext
+        set(cls, "_isSystemWindow", onMetaClass: true) { _, _ in true }
+        // 声明 CAContext 由本进程自己管，不让 WindowServer 托管
+        set(cls, "_isWindowServerHostingManaged", onMetaClass: false) { _, _ in false }
+        // secure 上下文建不出来时窗口会静默消失（见 2.1.6 的 1.8.x 踩坑记录）
+        set(cls, "_isSecure", onMetaClass: false) { _, _ in false }
+        // 窗口要参与命中，否则 UIKit 事件永远进不来
+        set(cls, "_ignoresHitTest", onMetaClass: false) { _, _ in false }
+    }
+
+    private static func set(_ cls: AnyClass,
+                            _ name: String,
+                            onMetaClass: Bool,
+                            body: @convention(c) (AnyObject, Selector) -> Bool) {
+        guard let target: AnyClass = onMetaClass ? object_getClass(cls) : cls else { return }
+        let selector = NSSelectorFromString(name)
+        let block: IMP = unsafeBitCast(body, to: IMP.self)
+        if class_getInstanceMethod(target, selector) != nil {
+            class_replaceMethod(target, selector, block, "B@:")
+            NSLog("[QFSpeed] 已替换 \(onMetaClass ? "+" : "-")\(name)")
+        } else {
+            class_addMethod(target, selector, block, "B@:")
+            NSLog("[QFSpeed] 已注入 \(onMetaClass ? "+" : "-")\(name)")
+        }
     }
 }
 
@@ -162,16 +205,21 @@ final class FloatingWindowManager {
     /// 注入到 SpringBoard 时 connectedScenes 可能为空，但 UIWindow 本身
     /// 完全可以脱离 scene 工作（只是不会被 scene 生命周期管理）。
     private func buildWindowWithoutScene() {
+        // 必须在建窗前补上私有方法，否则窗口拿到的是「普通 App 窗口」身份，
+        // SpringBoard 直接不合成 —— 就是「注册成功但屏幕上没有」的根源。
+        WindowPrivateOverrides.install()
+
         let screen = UIScreen.main.bounds
         let w = PassThroughWindow(frame: screen)
-        w.windowLevel = UIWindow.Level.alert + 1
+        // 层级对齐 2.1.6：能盖住状态栏/通知中心，又不会高到连系统弹窗都压下去。
+        w.windowLevel = UIWindow.Level(rawValue: 10_000_000)
         w.backgroundColor = .clear
         w.isOpaque = false
 
-        // ⚠️ 顺序关键：secure context 必须在窗口上屏之前标记，
-        // 否则 CAContext 已经按非 secure 建好，再设也没用。
-        // TrollSpeed 就是先设这个再托管。
-        SpringBoardWindowHost.shared.markSecure(w)
+        // 注意：这里刻意不强制 secure 上下文。
+        // 2.1.6 的 1.8.x 就栽在「先开 secure」上：一旦 secure-mode 权限没被系统认下，
+        // CAContext 根本建不出来，而窗口对象、hidden、alpha 全是正常的，屏幕上什么都没有。
+        // 先非 secure，能截屏也能自己确认；真要 ctx=0 再升 secure 重试。
 
         let controller = OverlayHostController(store: store, provider: provider, layout: layout)
         w.rootViewController = controller
@@ -187,8 +235,17 @@ final class FloatingWindowManager {
             self.syncHitRegion()
         }
 
-        let hosted = SpringBoardWindowHost.shared.host(w)
-        NSLog("[QFSpeed] 无 scene 建窗，SpringBoard 托管: \(hosted)")
+        // 注入进 SpringBoard 时，窗口本来就在系统 UI 层，自己托管给自己没有意义，
+        // 反而会把已经正常的 CAContext 再注册一次，容易把窗口弄没。
+        // 只有独立 App 形态才需要借 SpringBoard 托管来跨 App 显示。
+        let hosted: Bool
+        if SpringBoardWindowHost.shared.wasInjected {
+            hosted = false
+            NSLog("[QFSpeed] 注入模式：窗口直接挂在 SpringBoard 上，跳过托管")
+        } else {
+            hosted = SpringBoardWindowHost.shared.host(w)
+            NSLog("[QFSpeed] 无 scene 建窗，SpringBoard 托管: \(hosted)")
+        }
 
         host = controller
         window = w
@@ -198,21 +255,18 @@ final class FloatingWindowManager {
     }
 
     private func buildWindow(scene: UIWindowScene) {
+        WindowPrivateOverrides.install()
+
         let w = PassThroughWindow(windowScene: scene)
 
         // 层级选择：
-        //  - 有了 platform-application + 越权签名时，用 `.statusBar + 1` 能压在
+        //  - 有了 platform-application + 越权签名时，用层级 10000000 能压在
         //    绝大多数系统 UI 之上；但如果盖住 SpringBoard 的权限弹窗，
-        //    用户点不到「允许」就会把自己锁死，所以上限卡在 alert。
-        //  - 普通签名（自签/TrollStore 未越权）时只能 `.alert + 1`，
-        //    超过这个层级系统直接不理你。
-        w.windowLevel = UIWindow.Level.alert + 1
+        //    用户点不到「允许」就会把自己锁死。
+        //  - 普通签名（自签/TrollStore 未越权）时这个层级系统直接不理你。
+        w.windowLevel = UIWindow.Level(rawValue: 10_000_000)
         w.backgroundColor = .clear
         w.isOpaque = false
-
-        // ⚠️ secure context 必须在窗口上屏之前标记，否则 CAContext 已按非 secure
-        // 建好，再设也没用（参考 2.1.6：先设 secure 再托管）。
-        SpringBoardWindowHost.shared.markSecure(w)
 
         let controller = OverlayHostController(store: store, provider: provider, layout: layout)
         w.rootViewController = controller

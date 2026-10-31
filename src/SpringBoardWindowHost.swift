@@ -94,8 +94,11 @@ final class SpringBoardWindowHost {
     func host(_ window: UIWindow) -> Bool {
         guard !isHosted else { return true }
 
-        // ① 先标记 secure context —— 顺序很重要
-        markSecure(window)
+        // ① 默认不强制 secure 上下文。
+        // 2.1.6 的 1.8.x 栽过：secure-mode 权限一旦没被系统认下，CAContext 直接建不出来，
+        // 而窗口 hidden/alpha/bounds 全都正常，屏幕上什么都没有，全程不报错。
+        // secure 的唯一作用是「截屏时隐身」，对显示没有帮助，反而封掉了唯一的排查手段。
+        // 所以只在显式要求时才开。
 
         // ② 拿到真实 contextId
         guard let cid = contextID(of: window) else {
