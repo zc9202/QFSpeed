@@ -1,0 +1,26 @@
+# Xcode / build
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# macOS
+.DS_Store
+
+# 产物
+*.ipa
+Payload/
+*.dSYM
+build.log
+
+# 依赖
+Pods/
+.swiftpm/
+
+# 本地敏感文件
+*.p12
+*.mobileprovision
+.env

@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>QFSpeed 复刻预览</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; overflow:hidden; }
+  body {
+    background:#0b0b0d;
+    font-family:-apple-system,"SF Pro Text","PingFang SC",system-ui,sans-serif;
+    color:#fff;
+    transition:background .3s;
+  }
+
+  /* ===== 演示宿主 ===== */
+  #host {
+    position:fixed; inset:0;
+    background:linear-gradient(160deg,#0d0d12 0%,#14101c 60%,#0a0a0e 100%);
+    display:flex; flex-direction:column;
+    padding:64px 22px 22px;
+    overflow-y:auto;
+  }
+  #host h1 { font-size:34px; font-weight:800; letter-spacing:-1px; }
+  #host .sub { font-size:13.5px; color:rgba(255,255,255,.45); margin-top:4px; }
+  .card {
+    background:rgba(255,255,255,.045);
+    border:.5px solid rgba(255,255,255,.07);
+    border-radius:16px;
+    padding:15px;
+    margin-top:16px;
+  }
+  .card .lbl {
+    font-size:11.5px; font-weight:600; letter-spacing:.5px;
+    color:rgba(255,255,255,.4); text-transform:uppercase; margin-bottom:10px;
+  }
+  .row { display:flex; justify-content:space-between; align-items:center; padding:6px 0; font-size:13.5px; }
+  .row .k { color:rgba(255,255,255,.55); }
+  .row .v { font-family:ui-monospace,Menlo,monospace; font-weight:600; }
+  .hint { font-size:11.5px; color:rgba(255,255,255,.32); line-height:1.65; margin-top:8px; }
+
+  /* ===== 悬浮条 ===== */
+  #bar {
+    position:fixed; left:50%; top:20%;
+    transform:translate(-50%,-50%) scale(.92);
+    transform-origin:center center;
+    display:flex; align-items:center;
+    gap:4.6px;
+    padding:5px 8px;
+    border-radius:999px;
+    background:rgba(18,18,20,.6);
+    -webkit-backdrop-filter:blur(24px) saturate(180%);
+    backdrop-filter:blur(24px) saturate(180%);
+    border:.5px solid rgba(255,255,255,.09);
+    box-shadow:0 4px 16px rgba(0,0,0,.45);
+    z-index:100;
+    white-space:nowrap;
+    box-sizing:border-box;
+    transition:transform .3s cubic-bezier(.34,1.4,.64,1), opacity .22s;
+    touch-action:none;
+  }
+  #bar.dragging { transition:opacity .22s; }
+  #bar.hidden { opacity:0; pointer-events:none; }
+  /* 贴边隐藏的位移由 JS 统一算进 transform，这里不再单独覆盖 */
+
+  .item { display:flex; align-items:center; gap:2.6px; }
+  .item .tag { font-size:10.8px; font-weight:500; letter-spacing:.1px; }
+  .item .val {
+    font-family:ui-monospace,"SF Mono",Menlo,monospace;
+    font-size:12px; font-weight:600;
+    font-variant-numeric:tabular-nums;
+    color:#fff;
+  }
+  .div { width:.5px; height:12.6px; background:rgba(255,255,255,.13); }
+
+  /* 8 项配色 */
+  .c-cpu{color:#4fbfee}.c-fps{color:#9e80fa}.c-up{color:#47d9b3}.c-down{color:#5cb8fa}
+  .c-bat{color:#fac04d}.c-cur{color:#fa8cc0}.c-watt{color:#fa7373}.c-temp{color:#fa9952}
+
+  /* ===== 设定面板 ===== */
+  #panel {
+    position:fixed; inset:0;
+    z-index:200;
+    display:flex; align-items:flex-end; justify-content:center;
+    pointer-events:none;
+  }
+  #panel.open { pointer-events:auto; }
+  #scrim {
+    position:absolute; inset:0;
+    background:rgba(0,0,0,.45);
+    opacity:0; transition:opacity .25s;
+  }
+  #panel.open #scrim { opacity:1; }
+  #sheet {
+    position:relative;
+    width:min(400px, calc(100vw - 24px));
+    max-height:min(78vh, 720px);
+    margin-bottom:14px;
+    border-radius:26px;
+    background:rgba(28,28,30,.96);
+    -webkit-backdrop-filter:blur(30px);
+    backdrop-filter:blur(30px);
+    border:.5px solid rgba(255,255,255,.09);
+    box-shadow:0 16px 48px rgba(0,0,0,.6);
+    overflow-y:auto;
+    padding:18px 18px 16px;
+    transform:translateY(24px) scale(.98);
+    opacity:0;
+    transition:transform .34s cubic-bezier(.34,1.3,.64,1), opacity .25s;
+    -webkit-overflow-scrolling:touch;
+  }
+  #panel.open #sheet { transform:none; opacity:1; }
+  #sheet::-webkit-scrollbar { display:none; }
+
+  .title { font-size:26px; font-weight:800; letter-spacing:-.6px; }
+  .subtitle { font-size:13px; color:rgba(255,255,255,.55); margin-top:2px; }
+  .mount {
+    display:inline-flex; align-items:center; gap:5px; margin-top:7px;
+    font-family:ui-monospace,Menlo,monospace; font-size:10.5px;
+    color:rgba(255,255,255,.36);
+  }
+  .mount .lv {
+    padding:1px 5px; border-radius:99px; background:rgba(255,255,255,.1);
+  }
+
+  .sec { margin-top:20px; }
+  .sec > .h {
+    font-size:11.5px; font-weight:600; letter-spacing:.6px;
+    color:rgba(255,255,255,.4); text-transform:uppercase; margin-bottom:9px;
+  }
+  .group {
+    background:rgba(255,255,255,.05);
+    border:.5px solid rgba(255,255,255,.06);
+    border-radius:15px;
+    padding:4px 14px;
+  }
+
+  .mrow {
+    display:flex; align-items:center; gap:11px;
+    padding:9px 0;
+    cursor:pointer;
+    border-bottom:.5px solid rgba(255,255,255,.06);
+  }
+  .mrow:last-child { border-bottom:none; }
+  .mrow .ic { width:20px; text-align:center; font-size:13px; }
+  .mrow .nm { font-size:14.5px; font-weight:500; flex:1; }
+  .mrow.off .nm { color:rgba(255,255,255,.4); }
+  .mrow.off .ic { color:rgba(255,255,255,.22) !important; }
+  .chk {
+    width:21px; height:21px; border-radius:50%;
+    display:grid; place-items:center;
+    font-size:10px; font-weight:900; color:rgba(0,0,0,.78);
+    background:rgba(255,255,255,.12);
+    transition:background .2s;
+  }
+  .mrow.off .chk { background:rgba(255,255,255,.1); color:transparent; }
+
+  .srow { padding:11px 0; border-bottom:.5px solid rgba(255,255,255,.06); }
+  .srow:last-child { border-bottom:none; }
+  .srow .top { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:7px; }
+  .srow .top .n { font-size:14px; font-weight:500; color:rgba(255,255,255,.85); }
+  .srow .top .v { font-family:ui-monospace,Menlo,monospace; font-size:12.5px; font-weight:600; color:rgba(255,255,255,.55); }
+  .srow .top .v.pick { color:#5cb8fa; }
+
+  input[type=range] {
+    -webkit-appearance:none; width:100%; height:4px; border-radius:2px;
+    background:rgba(255,255,255,.14); outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; width:20px; height:20px; border-radius:50%;
+    background:#fff; box-shadow:0 1px 4px rgba(0,0,0,.4); cursor:pointer;
+  }
+
+  /* 方向键 */
+  .dpad { display:flex; flex-direction:column; align-items:center; gap:6px; padding:6px 0 2px; }
+  .dpad .mid { display:flex; gap:6px; align-items:center; }
+  .btn {
+    display:grid; place-items:center;
+    border-radius:10px; background:rgba(255,255,255,.07);
+    color:rgba(255,255,255,.8); font-size:14px; font-weight:700;
+    cursor:pointer; user-select:none;
+    transition:background .15s, transform .1s;
+  }
+  .btn:active { background:rgba(255,255,255,.16); transform:scale(.94); }
+  .btn.arrow { width:44px; height:38px; }
+  .btn.center { width:62px; height:38px; font-size:13px; font-weight:600; }
+  .btn.lockon { background:rgba(92,184,250,.22); color:#80d0ff; }
+
+  .seg { display:flex; background:rgba(255,255,255,.08); border-radius:9px; padding:2px; gap:2px; }
+  .seg .o { padding:5px 14px; border-radius:7px; font-size:12px; font-weight:600; color:rgba(255,255,255,.55); cursor:pointer; }
+  .seg .o.on { background:rgba(255,255,255,.16); color:#fff; }
+
+  .note { font-size:12px; color:rgba(255,255,255,.45); margin-top:10px; }
+
+  .act { display:flex; gap:9px; margin-top:9px; }
+  .act .b {
+    flex:1; height:44px; display:flex; align-items:center; justify-content:center; gap:5px;
+    border-radius:12px; background:rgba(255,255,255,.07);
+    font-size:13px; font-weight:600; color:rgba(255,255,255,.82);
+    cursor:pointer; transition:background .15s;
+  }
+  .act .b:active { background:rgba(255,255,255,.14); }
+  .act .b.on { background:rgba(92,184,250,.22); color:#80d0ff; }
+  .act .b.danger { color:#ff7373; }
+
+  #closeBtn {
+    margin-top:12px; height:46px; width:100%;
+    border-radius:13px; background:rgba(255,255,255,.11);
+    display:grid; place-items:center;
+    font-size:15px; font-weight:600; color:#fff; cursor:pointer;
+  }
+  #closeBtn:active { background:rgba(255,255,255,.18); }
+
+  .foot { font-size:11px; color:rgba(255,255,255,.3); line-height:1.7; margin-top:14px; }
+
+  @media (min-width:820px){
+    body{display:flex;justify-content:center;background:#08080a}
+  }
+</style>
+</head>
+<body>
+
+<!-- 演示宿主 -->
+<div id="host">
+  <h1>QFSpeed</h1>
+  <div class="sub">悬浮性能条 · 独立 App 宿主</div>
+
+  <div class="card">
+    <div class="lbl">状态</div>
+    <div class="row"><span class="k">悬浮窗</span><span class="v" id="s-vis" style="color:#5cd97a">显示中</span></div>
+    <div class="row"><span class="k">位置锁定</span><span class="v" id="s-lock" style="color:#5cd97a">可拖动</span></div>
+    <div class="row"><span class="k">贴边隐藏</span><span class="v" id="s-edge" style="color:#8a8a92">关闭</span></div>
+    <div class="row"><span class="k">显示项目</span><span class="v" id="s-count">8 / 8</span></div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">操作</div>
+    <div class="hint">
+      · 拖动悬浮条 → 移动位置，松手自动吸附边缘<br>
+      · 轻点悬浮条 → 打开设定面板<br>
+      · 拖到左右边缘（开启贴边隐藏后）→ 半收进屏幕，点一下召回
+    </div>
+  </div>
+</div>
+
+<!-- 悬浮条 -->
+<div id="bar">
+  <div class="item" data-k="cpu"><span class="tag c-cpu">CPU</span><span class="val">23%</span></div>
+  <div class="div"></div>
+  <div class="item" data-k="fps"><span class="tag c-fps">FPS</span><span class="val">60</span></div>
+  <div class="div"></div>
+  <div class="item" data-k="upload"><span class="tag c-up">↑</span><span class="val">16B</span></div>
+  <div class="div"></div>
+  <div class="item" data-k="download"><span class="tag c-down">↓</span><span class="val">39B</span></div>
+  <div class="div"></div>
+  <div class="item" data-k="battery"><span class="tag c-bat">电池</span><span class="val">94%</span></div>
+  <div class="div"></div>
+  <div class="item" data-k="current"><span class="tag c-cur">mA</span><span class="val">382</span></div>
+  <div class="div"></div>
+  <div class="item" data-k="watt"><span class="tag c-watt">W</span><span class="val">1.5</span></div>
+  <div class="div"></div>
+  <div class="item" data-k="temperature"><span class="tag c-temp">°C</span><span class="val">32</span></div>
+</div>
+
+<!-- 设定面板 -->
+<div id="panel">
+  <div id="scrim"></div>
+  <div id="sheet">
+    <div class="title">QFSpeed</div>
+    <div class="subtitle">网速 · 性能 · 电量</div>
+    <div class="mount">▣ 挂载 host UIWindow <span class="lv">lv=0</span></div>
+
+    <div class="sec">
+      <div class="h">显示项目</div>
+      <div class="group" id="metricList"></div>
+    </div>
+
+    <div class="sec">
+      <div class="h">外观</div>
+      <div class="group">
+        <div class="srow">
+          <div class="top"><span class="n">字体大小</span><span class="v" id="v-font">12pt</span></div>
+          <input type="range" id="r-font" min="9" max="20" step="1" value="12">
+        </div>
+        <div class="srow">
+          <div class="top"><span class="n">整体缩放</span><span class="v" id="v-scale">0.92x</span></div>
+          <input type="range" id="r-scale" min="0.6" max="1.6" step="0.01" value="0.92">
+        </div>
+        <div class="srow">
+          <div class="top"><span class="n">背景不透明度</span><span class="v" id="v-op">55%</span></div>
+          <input type="range" id="r-op" min="0.15" max="0.95" step="0.01" value="0.55">
+        </div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="h">位置调节</div>
+      <div class="group">
+        <div class="dpad">
+          <div class="btn arrow" data-dir="up">⌃</div>
+          <div class="mid">
+            <div class="btn arrow" data-dir="left">‹</div>
+            <div class="btn center" data-dir="center">中心</div>
+            <div class="btn arrow" data-dir="right">›</div>
+          </div>
+          <div class="btn arrow" data-dir="down">⌄</div>
+        </div>
+        <div class="srow" style="display:flex;align-items:center;justify-content:space-between">
+          <span class="n" style="font-size:13px;color:rgba(255,255,255,.55)">微调步长</span>
+          <div class="seg" id="segStep">
+            <div class="o" data-step="1">1pt</div>
+            <div class="o on" data-step="8">8pt</div>
+          </div>
+        </div>
+        <div class="note" id="lockNote">自由移动（直接拖动悬浮条）</div>
+      </div>
+    </div>
+
+    <div class="sec" style="margin-top:16px">
+      <div class="act">
+        <div class="b" id="btnLock">🔓 锁定位置</div>
+        <div class="b" id="btnReset">↺ 重置位置</div>
+      </div>
+      <div class="act">
+        <div class="b" id="btnEdge">◧ 贴边隐藏</div>
+        <div class="b danger" id="btnHide">🚫 隐藏悬浮窗</div>
+      </div>
+      <div id="closeBtn">关闭面板</div>
+    </div>
+
+    <div class="foot">「锁定位置」开启后悬浮条无法拖动，只能靠定位按钮 / 微调移动；关闭则可在任意位置自由拖动。</div>
+  </div>
+</div>
+
+<script>
+const METRICS = [
+  { k:'cpu',        t:'CPU 占用',   ic:'▤', c:'#4fbfee' },
+  { k:'fps',        t:'FPS 帧率',   ic:'◷', c:'#9e80fa' },
+  { k:'upload',     t:'上传速度',   ic:'↑', c:'#47d9b3' },
+  { k:'download',   t:'下载速度',   ic:'↓', c:'#5cb8fa' },
+  { k:'battery',    t:'电池电量',   ic:'▮', c:'#fac04d' },
+  { k:'current',    t:'电流',       ic:'⚡', c:'#fa8cc0' },
+  { k:'watt',       t:'瓦数',       ic:'✦', c:'#fa7373' },
+  { k:'temperature',t:'温度',       ic:'🌡', c:'#fa9952' },
+];
+
+const state = {
+  on:{}, scale:0.92, font:12, op:0.55,
+  locked:false, edge:false, visible:true,
+  step:8, peek:null, x:null, y:null,
+  /** 超宽时自动缩小，保证整条不超出屏幕 */
+  fit:1,
+  /** 贴边只露出的宽度（px） */
+  peekPx:7,
+};
+
+METRICS.forEach(m => state.on[m.k] = true);
+
+/* ---- 构建开关列表 ---- */
+const listEl = document.getElementById('metricList');
+METRICS.forEach(m => {
+  const d = document.createElement('div');
+  d.className = 'mrow';
+  d.dataset.k = m.k;
+  d.innerHTML = `<span class="ic" style="color:${m.c}">${m.ic}</span>
+                 <span class="nm">${m.t}</span>
+                 <span class="chk" style="background:${m.c}">✓</span>`;
+  d.onclick = () => { state.on[m.k] = !state.on[m.k]; sync(); };
+  listEl.appendChild(d);
+});
+
+/* ---- 悬浮条渲染 ---- */
+const TAGS = { cpu:'', fps:'FPS', upload:'↑', download:'↓',
+               battery:'电池', current:'mA', watt:'W', temperature:'°C' };
+const TAGCLS = { cpu:'cpu', fps:'fps', upload:'up', download:'down',
+                 battery:'bat', current:'cur', watt:'watt', temperature:'temp' };
+// 截图里的实时值
+const VALS = { cpu:'23%', fps:'60', upload:'16B', download:'39B',
+               battery:'94%', current:'382', watt:'1.5', temperature:'32' };
+
+const bar = document.getElementById('bar');
+function renderBar(){
+  const parts = [];
+  METRICS.forEach((m,i) => {
+    if (!state.on[m.k]) return;
+    if (parts.length) parts.push('<div class="div"></div>');
+    const el = document.createElement('div');
+    el.className = 'item';
+    // 标签与数值严格照截图：极短，能塞进一行
+    el.innerHTML =
+      `<span class="tag c-${TAGCLS[m.k]}">${TAGS[m.k]}</span>` +
+      `<span class="val">${VALS[m.k]}</span>`;
+    parts.push(el.outerHTML);
+  });
+  bar.innerHTML = parts.length ? parts.join('') : '<div class="item"><span class="val" style="color:rgba(255,255,255,.4)">无显示项</span></div>';
+  const active = METRICS.filter(m=>state.on[m.k]).length;
+  document.getElementById('s-count').textContent = `${active} / 8`;
+}
+
+/* ---- 位置 ---- */
+function applyPos(){
+  const w = innerWidth, h = innerHeight;
+  if (state.x === null) state.x = w/2;
+  if (state.y === null) state.y = h*0.20;
+  bar.style.left = state.x + 'px';
+  bar.style.top  = state.y + 'px';
+
+  // 贴边隐藏：把条推出屏幕，只留 PEEK 像素的把手
+  const half = bar.offsetWidth * state.scale * state.fit / 2;
+  let dx = 0;
+  if (state.peek === 'left') {
+    dx = half - PEEK;
+  } else if (state.peek === 'right') {
+    dx = -(half - PEEK);
+  }
+
+  // 直接写 transform，不走 CSS 变量 —— WebKit 对 `scale(var(--x))` 里的变量
+  // 更新不保证重算 transform，会卡在旧比例上。
+  bar.style.transform =
+    `translate(calc(-50% + ${dx}px),-50%) scale(${state.scale * state.fit})`;
+}
+function clampPos(){
+  const w = innerWidth, h = innerHeight;
+  const r = bar.getBoundingClientRect();
+  const halfW = r.width / 2;
+  const halfH = r.height / 2;
+  state.x = Math.min(Math.max(state.x, halfW), w - halfW);
+  state.y = Math.min(Math.max(state.y, halfH), h - halfH);
+}
+
+/* ---- 拖动 ---- */
+let drag = null;
+bar.addEventListener('pointerdown', e => {
+  if (state.locked) return;
+  if (state.peek) { state.peek = null; sync(); }
+  drag = { sx:e.clientX, sy:e.clientY, ox:state.x, oy:state.y, t0:Date.now() };
+  bar.classList.add('dragging');
+  bar.setPointerCapture(e.pointerId);
+});
+bar.addEventListener('pointermove', e => {
+  if (!drag) return;
+  state.x = drag.ox + (e.clientX - drag.sx);
+  state.y = drag.oy + (e.clientY - drag.sy);
+  applyPos();
+});
+bar.addEventListener('pointerup', e => {
+  if (!drag) return;
+  const moved = Math.hypot(e.clientX-drag.sx, e.clientY-drag.sy);
+  const dt = Date.now() - drag.t0;
+  bar.classList.remove('dragging');
+  drag = null;
+
+  if (moved < 6 && dt < 400) { openPanel(); return; }   // 当作点击
+
+  clampPos(); applyPos();
+  // 吸附：14px 内吸边
+  const w=innerWidth, h=innerHeight, r=bar.getBoundingClientRect(), SNAP=14;
+  if (r.left < SNAP) state.x = r.width/2;
+  else if (r.right > w - SNAP) state.x = w - r.width/2;
+  if (r.top < SNAP) state.y = r.height/2;
+  else if (r.bottom > h - SNAP) state.y = h - r.height/2;
+  applyPos();
+
+  // 贴边隐藏
+  if (state.edge) {
+    const rr = bar.getBoundingClientRect();
+    if (rr.left <= 1) state.peek = 'left';
+    else if (rr.right >= w - 1) state.peek = 'right';
+    else state.peek = null;
+  }
+  sync();
+});
+
+/* ---- 面板 ---- */
+const panel = document.getElementById('panel');
+function openPanel(){ panel.classList.add('open'); }
+function closePanel(){ panel.classList.remove('open'); }
+document.getElementById('scrim').onclick = closePanel;
+document.getElementById('closeBtn').onclick = closePanel;
+
+/* ---- 控件绑定 ---- */
+document.getElementById('r-font').oninput = e => {
+  state.font = +e.target.value;
+  document.getElementById('v-font').textContent = state.font + 'pt';
+  bar.style.fontSize = state.font + 'px';
+  document.querySelectorAll('#bar .val').forEach(v => v.style.fontSize = state.font + 'px');
+  document.querySelectorAll('#bar .tag').forEach(v => v.style.fontSize = (state.font*0.9) + 'px');
+  document.querySelectorAll('#bar .div').forEach(v => v.style.height = (state.font*1.05) + 'px');
+};
+document.getElementById('r-scale').oninput = e => {
+  state.scale = +e.target.value;
+  document.getElementById('v-scale').textContent = state.scale.toFixed(2) + 'x';
+  applyPos();
+};
+document.getElementById('r-op').oninput = e => {
+  state.op = +e.target.value;
+  document.getElementById('v-op').textContent = Math.round(state.op*100) + '%';
+  bar.style.background = `rgba(18,18,20,${state.op})`;
+};
+
+document.querySelectorAll('#segStep .o').forEach(o => {
+  o.onclick = () => {
+    document.querySelectorAll('#segStep .o').forEach(x=>x.classList.remove('on'));
+    o.classList.add('on');
+    state.step = +o.dataset.step;
+  };
+});
+
+document.querySelectorAll('[data-dir]').forEach(b => {
+  b.onclick = () => {
+    const s = state.step;
+    if (b.dataset.dir === 'up')    state.y -= s;
+    if (b.dataset.dir === 'down')  state.y += s;
+    if (b.dataset.dir === 'left')  state.x -= s;
+    if (b.dataset.dir === 'right') state.x += s;
+    if (b.dataset.dir === 'center'){ state.x = innerWidth/2; state.y = innerHeight*0.20; }
+    if (state.peek) state.peek = null;
+    clampPos(); applyPos();
+  };
+});
+
+document.getElementById('btnLock').onclick = () => { state.locked = !state.locked; sync(); };
+document.getElementById('btnReset').onclick = () => {
+  state.peek = null;
+  state.x = innerWidth/2; state.y = innerHeight*0.20;
+  applyPos(); sync();
+};
+document.getElementById('btnEdge').onclick = () => {
+  state.edge = !state.edge;
+  if (!state.edge) state.peek = null;
+  sync();
+};
+document.getElementById('btnHide').onclick = () => { state.visible = false; sync(); closePanel(); };
+
+/* ---- 统一同步 ---- */
+function sync(){
+  // 开关列表
+  document.querySelectorAll('.mrow').forEach(d => {
+    const on = state.on[d.dataset.k];
+    d.classList.toggle('off', !on);
+    const chk = d.querySelector('.chk');
+    const m = METRICS.find(x=>x.k===d.dataset.k);
+    chk.style.background = on ? m.c : 'rgba(255,255,255,.1)';
+    chk.style.color = on ? 'rgba(0,0,0,.78)' : 'transparent';
+  });
+
+  // 悬浮条显隐 / 贴边
+  bar.classList.toggle('hidden', !state.visible);
+  applyPos();   // 位置和贴边位移都由它算，别在这里再动 class
+
+  // 文案
+  const lock = document.getElementById('btnLock');
+  lock.textContent = state.locked ? '🔒 已锁定' : '🔓 锁定位置';
+  lock.classList.toggle('on', state.locked);
+  document.getElementById('lockNote').textContent =
+    state.locked ? '位置已锁定 · 只能用微调按钮移动' : '自由移动（直接拖动悬浮条）';
+  document.getElementById('btnEdge').classList.toggle('on', state.edge);
+
+  document.getElementById('s-vis').textContent = state.visible ? '显示中' : '已隐藏';
+  document.getElementById('s-vis').style.color = state.visible ? '#5cd97a' : '#8a8a92';
+  document.getElementById('s-lock').textContent = state.locked ? '已锁定' : '可拖动';
+  document.getElementById('s-lock').style.color = state.locked ? '#fac04d' : '#5cd97a';
+  document.getElementById('s-edge').textContent = state.edge ? '开启' : '关闭';
+  document.getElementById('s-edge').style.color = state.edge ? '#5cb8fa' : '#8a8a92';
+
+  renderBar();
+  measureFit();
+  applyPos();
+}
+
+/** 量一次未缩放的宽度，算出「不超屏」所需系数。
+ *  用 offsetWidth 而不是 getBoundingClientRect —— 后者会带上 transform，
+ *  而 transform 有 0.3s 过渡，刚改完立刻读拿到的是插值中间态。 */
+function measureFit(){
+  // 条子不再有 max-width，offsetWidth 就是内容自然宽度（不含 transform）
+  const natural = bar.offsetWidth;
+  const avail = innerWidth - 10;
+  state.fit = natural > avail ? Math.max(avail / natural, 0.42) : 1;
+}
+
+const PEEK = 7;
+
+/* ---- 启动 ---- */
+window.addEventListener('resize', () => { clampPos(); applyPos(); });
+sync();
+</script>
+</body>
+</html>

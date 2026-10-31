@@ -1,0 +1,71 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --find swiftc
+
+      - name: Install ldid
+        run: |
+          # ldid 用于写 entitlements（TrollStore 依赖它）
+          if ! command -v ldid >/dev/null 2>&1; then
+            brew install ldid 2>/dev/null || {
+              curl -fsSL -o /tmp/ldid.zip \
+                https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64.zip
+              unzip -o /tmp/ldid.zip -d /tmp/ldid || true
+              sudo cp /tmp/ldid/ldid /usr/local/bin/ 2>/dev/null || true
+              chmod +x /usr/local/bin/ldid 2>/dev/null || true
+            }
+          fi
+          ldid -h 2>&1 | head -3 || echo "ldid 不可用，继续（产物无 entitlements）"
+
+      - name: Build
+        run: |
+          chmod +x build.sh
+          bash build.sh "$GITHUB_WORKSPACE/QFSpeed.ipa"
+
+      - name: Inspect
+        run: |
+          set +e
+          echo "=== IPA ==="
+          ls -lh QFSpeed.ipa
+          unzip -l QFSpeed.ipa
+
+          echo "=== dylib ==="
+          ls -lh QFSpeedOverlay.dylib 2>/dev/null || echo "!! dylib 未产出"
+
+          echo "=== 二进制架构 ==="
+          lipo -info Payload/*.app/QFSpeed 2>/dev/null || true
+
+          echo "=== 确认 constructor 进 dylib 了 ==="
+          nm -U QFSpeedOverlay.dylib 2>/dev/null | grep -i ctor || echo "(ctor 符号检查跳过)"
+
+          echo "=== entitlements ==="
+          codesign -d --entitlements - Payload/*.app/QFSpeed 2>&1 | head -20
+
+      - name: Package both
+        run: |
+          # 把 dylib 一并塞进 zip，方便一次下载
+          mkdir -p dist
+          cp QFSpeed.ipa dist/ 2>/dev/null || true
+          cp QFSpeedOverlay.dylib dist/ 2>/dev/null || true
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QFSpeed-bundle
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
