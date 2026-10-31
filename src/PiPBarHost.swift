@@ -5,37 +5,40 @@ import CoreMedia
 import CoreVideo
 import SwiftUI
 
-/// 跨 App 常驻 + 全局拖动的**非越狱**实现（移植自 2.1.6 的 QFPiPBar）。
+/// 跨 App 常驻（非越狱）实现 —— 系统画中画，移植自 2.1.6 的 QFPiPBar。
 ///
-/// 为什么必须有这一层：
-///   App 自己的 UIWindow 一退到后台就失去合成权，这是系统物理限制，不是 bug。
-///   `SBSAccessibilityWindowHostingController` 那条托管路在真机上被证死过：
-///   注册成功、层级够高，屏幕上依然什么都没有。
-///   1.zip 里 2.1.6 给出的唯一「不越狱也能跨 App 常驻」的路径就是画中画：
-///   由**系统**合成 PiP 窗口，浮在任意 App 之上，而且用户可以随手把它拖到屏幕任何位置，
-///   系统还会记住位置。这正是「全局拖动 + 常驻显示」能落地的那条路。
+/// 上一版为什么不生效（这次修的就是这些）：
+///   1. `prepare()` 只建了渲染层，**从来没激活过 AVAudioSession**。
+///      系统判定「这段内容在播放」的唯一依据就是音频会话是 active 的，
+///      没有它，`canStartPictureInPictureAutomaticallyFromInline` 永远不会触发。
+///   2. 没有监听退到后台的通知，全靠系统自己猜时机，猜不中就什么都不发生。
+///   3. 帧率 1fps 太稀，系统有时认为画面已停。
 ///
-/// 样式怎么保持不变：
-///   不另画一套 UI。直接把 App 内同一个 `FloatingBarView` 渲染成位图，
-///   每秒喂进 AVSampleBufferDisplayLayer —— 字号、间距、配色、圆角、图标全部与 App 内一致。
-///
-/// 注入 SpringBoard（TrollFools / deb）时不需要它：那条路是真的系统级窗口，会自动跳过。
+/// 现在：prepare 就把静音音轨跑起来（会话常亮），并在 `willResignActive` /
+/// `didEnterBackground` 主动调一次 start，双保险。
 final class PiPBarHost: NSObject {
 
     static let shared = PiPBarHost()
 
-    /// 画布宽高比决定 PiP 窗口比例。2.5:1 接近横条，字又不会太小（沿用 2.1.6 的取值）。
-    private let canvasWidth: CGFloat = 480
-    private let canvasHeight: CGFloat = 192
+    /// 画布尺寸决定 PiP 窗口的宽高比。
+    /// 按浮条自身比例算，PiP 窗口就是一条细长浮条（不会上下带黑边）。
+    private var canvasWidth: CGFloat = 480
+    private var canvasHeight: CGFloat = 150
 
     private var displayLayer: AVSampleBufferDisplayLayer?
     private var pipController: AVPictureInPictureController?
+    private var contentSource: AVPictureInPictureController.ContentSource?
     private var anchorView: UIView?
+    private var renderHost: UIHostingController<FloatingBarView>?
     private var feedTimer: Timer?
     private var timebase: CMTimebase?
     private var keepAlivePlayer: AVAudioPlayer?
+    private var observers: [NSObjectProtocol] = []
+    private var possibleObservation: NSKeyValueObservation?
+    private var lastBuffer: CVPixelBuffer?
+    private var lastRenderAt: TimeInterval = 0
+    private var dirty = true
 
-    /// 当前要画的快照，由 OverlayRootView 每次采样后推过来
     private var snapshot: MetricsSnapshot = .empty
     private var metrics: [MetricKind] = []
     private var fontSize: CGFloat = 12
@@ -45,14 +48,16 @@ final class PiPBarHost: NSObject {
     private(set) var isPrepared = false
     private(set) var isRunning = false
     private(set) var lastError: String?
+    private(set) var audioActive = false
+    private(set) var frameCount: Int64 = 0
     private var startRetries = 0
-    private var frameIndex: Int64 = 0
+    /// 用户明确关掉 PiP 后就不再自动拉起，否则关了又弹很烦
+    private(set) var stopRequested = false
 
     private override init() { super.init() }
 
     // MARK: - 对外
 
-    /// 把最新的显示内容推给常驻层（与 App 内浮条同一份数据、同一个视图）
     func update(metrics: [MetricKind],
                 snapshot: MetricsSnapshot,
                 fontSize: CGFloat,
@@ -63,38 +68,37 @@ final class PiPBarHost: NSObject {
         self.fontSize = fontSize
         self.useIcon = useIcon
         self.backgroundOpacity = backgroundOpacity
-        guard isPrepared else { return }
-        renderFrame()
+        dirty = true
     }
 
-    /// 准备渲染层。真正「浮起来」由系统在 App 进后台时自动完成。
+    /// 建渲染层 + 把静音音轨跑起来。这一步之后，用户按 Home 就该浮起来。
     func prepare() {
-        guard !SpringBoardWindowHost.shared.wasInjected else {
-            // 注入形态已经是真的系统级窗口，不需要画中画
+        guard !SpringBoardWindowHost.shared.wasInjected else { return }
+        if isPrepared {
+            startAudioKeepAlive()   // 会话可能被系统回收，补一次
             return
         }
-        guard !isPrepared else { return }
         guard AVPictureInPictureController.isPictureInPictureSupported() else {
             lastError = "这台设备不支持画中画"
             return
         }
         guard let host = Self.anchorHostView() else {
-            // 窗口还没就绪，稍后重试
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                 self?.prepare()
             }
             return
         }
 
-        // 渲染层必须真的挂在视图层级里（hidden / alpha 0 会让 isPictureInPicturePossible 变 false），
-        // 所以塞一个 2x2 的锚点：用户看不见，系统认为它在渲染。
-        let anchor = UIView(frame: CGRect(x: 2, y: 2, width: 2, height: 2))
-        anchor.backgroundColor = .black
+        // 渲染层必须真在视图层级里，且尺寸非零；1×1 最容易通过系统校验，
+        // 又完全看不见（原来用 2×2 黑点，角落会有一丝痕迹）。
+        let anchor = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        anchor.backgroundColor = .clear
+        anchor.isOpaque = false
         anchor.isUserInteractionEnabled = false
         host.addSubview(anchor)
 
         let layer = AVSampleBufferDisplayLayer()
-        layer.frame = anchor.bounds
+        layer.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
         layer.videoGravity = .resizeAspect
         anchor.layer.addSublayer(layer)
 
@@ -107,8 +111,6 @@ final class PiPBarHost: NSObject {
             CMTimebaseSetRate(tb, rate: 1.0)
             layer.controlTimebase = tb
             timebase = tb
-        } else {
-            NSLog("[QFSpeed] 建 timebase 失败 status=%d", st)
         }
 
         let source = AVPictureInPictureController.ContentSource(
@@ -117,24 +119,29 @@ final class PiPBarHost: NSObject {
         )
         let controller = AVPictureInPictureController(contentSource: source)
         controller.delegate = self
-        // 用户按 Home / 切到别的 App 时自动浮起来，不必先回本 App 点按钮。
         controller.canStartPictureInPictureAutomaticallyFromInline = true
-        // 不设 requiresLinearPlayback：配合无限时长（直播语义）它是多余的，
-        // 而首次启动失败（PGPegasusErrorDomain -1003）往往就出在这种多余配置上。
 
-        // 提前喂帧：让渲染层在系统拉起 PiP 之前就 readyForDisplay。
-        // 层没真正开始渲染时调 start，系统直接甩 -1003。
         anchorView = anchor
         displayLayer = layer
+        contentSource = source
         pipController = controller
         isPrepared = true
         lastError = nil
+
+        possibleObservation = controller.observe(\.isPictureInPicturePossible, options: [.new]) { [weak self] _, _ in
+            // 只是让诊断卡片能实时反映出来，不在这里自动 start
+            self?.dirty = true
+        }
+
+        installObservers()
         startFeedTimer()
+        startAudioKeepAlive()   // ← 上一版缺的就是这一句
         NSLog("[QFSpeed] 画中画常驻已准备")
     }
 
-    /// 手动浮起（面板 / 主界面按钮）
+    /// 主动浮起。用户按 Home 前会被 willResignActive 调到。
     func start() {
+        stopRequested = false
         prepare()
         guard let controller = pipController, isPrepared else { return }
         if controller.isPictureInPictureActive {
@@ -142,10 +149,9 @@ final class PiPBarHost: NSObject {
             return
         }
         guard controller.isPictureInPicturePossible else {
-            // 层还没 ready，等一拍再试（最多 3 次，与 2.1.6 一致）
-            if startRetries < 3 {
+            if startRetries < 5 {
                 startRetries += 1
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
                     self?.start()
                 }
             } else {
@@ -155,28 +161,31 @@ final class PiPBarHost: NSObject {
         }
         startAudioKeepAlive()
         controller.startPictureInPicture()
-        isRunning = true
     }
-
     func stop() {
         startRetries = 0
         if let c = pipController, c.isPictureInPictureActive {
             c.stopPictureInPicture()
         }
-        keepAlivePlayer?.stop()
-        keepAlivePlayer = nil
         isRunning = false
     }
 
     func teardown() {
         stop()
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
         feedTimer?.invalidate()
         feedTimer = nil
+        keepAlivePlayer?.stop()
+        keepAlivePlayer = nil
+        audioActive = false
         anchorView?.removeFromSuperview()
         anchorView = nil
         renderHost = nil
         displayLayer = nil
+        contentSource = nil
         pipController = nil
+        possibleObservation = nil
         isPrepared = false
     }
 
@@ -185,7 +194,56 @@ final class PiPBarHost: NSObject {
         if !isPrepared { return lastError ?? "未准备" }
         if let c = pipController, c.isPictureInPictureActive { return "画中画常驻中" }
         if let e = lastError { return e }
-        return "已准备（切后台自动浮起）"
+        return audioActive ? "已准备（切后台自动浮起）" : "已准备（音频未激活）"
+    }
+
+    /// 诊断卡片用：把 PiP 每一步的判定都摊开，真机上不用猜。
+    var detailRows: [(String, String)] {
+        var rows: [(String, String)] = []
+        rows.append(("画中画支持", AVPictureInPictureController.isPictureInPictureSupported() ? "是" : "否"))
+        if let c = pipController {
+            rows.append(("pip possible", c.isPictureInPicturePossible ? "是" : "否"))
+            rows.append(("pip active", c.isPictureInPictureActive ? "是" : "否"))
+            rows.append(("自动浮起", c.canStartPictureInPictureAutomaticallyFromInline ? "开" : "关"))
+        } else {
+            rows.append(("pip", "未创建"))
+        }
+        rows.append(("音频会话", audioActive ? "active" : "未激活"))
+        if let l = displayLayer {
+            rows.append(("渲染层", l.status == .rendering ? "rendering"
+                         : (l.status == .failed ? "failed" : "idle")))
+        }
+        rows.append(("已喂帧", "\(frameCount) 帧"))
+        return rows
+    }
+
+    // MARK: - 后台时机
+
+    private func installObservers() {
+        let nc = NotificationCenter.default
+        // 即将失去活跃状态（按 Home / 切 App）—— 这是拉起画中画最可靠的时机
+        observers.append(nc.addObserver(forName: UIApplication.willResignActiveNotification,
+                                        object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            guard SettingsStore.shared.isVisible, !self.stopRequested else { return }
+            NSLog("[QFSpeed] willResignActive → 尝试浮起画中画")
+            self.start()
+        })
+        // 彻底进后台再兜一次（自动浮起失败时用）
+        observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                        object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            guard SettingsStore.shared.isVisible, !self.stopRequested else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                guard let c = self.pipController, !c.isPictureInPictureActive else { return }
+                NSLog("[QFSpeed] didEnterBackground → 补一次浮起")
+                self.start()
+            }
+        })
+        observers.append(nc.addObserver(forName: UIApplication.willEnterForegroundNotification,
+                                        object: nil, queue: .main) { [weak self] _ in
+            self?.startAudioKeepAlive()
+        })
     }
 
     // MARK: - 锚点宿主
@@ -213,25 +271,29 @@ final class PiPBarHost: NSObject {
 
     private func startFeedTimer() {
         feedTimer?.invalidate()
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.renderFrame()
+        // 4fps：既不至于让系统认为画面停了，也不至于把主线程画爆。
+        // 图像本身只在数据变化 / 超过 1 秒时才重绘，其余时候重复喂同一帧。
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.tick()
         }
         RunLoop.main.add(timer, forMode: .common)
         feedTimer = timer
-        renderFrame()
+        tick()
     }
 
-    private func renderFrame() {
-        guard let image = renderBarImage(), let buffer = pixelBuffer(from: image) else { return }
-        enqueue(buffer)
+    private func tick() {
+        let now = Date().timeIntervalSince1970
+        if dirty || lastBuffer == nil || now - lastRenderAt > 1.0 {
+            if let image = renderBarImage(), let buffer = pixelBuffer(from: image) {
+                lastBuffer = buffer
+                lastRenderAt = now
+                dirty = false
+            }
+        }
+        if let buffer = lastBuffer {
+            enqueue(buffer)
+        }
     }
-
-    private var renderHost: UIHostingController<FloatingBarView>?
-
-    /// 把**同一个** FloatingBarView 渲染成位图：样式与 App 内同源，不可能跑偏。
-    /// 用 UIHostingController 而不是 ImageRenderer —— 后者在 iOS 16 上有
-    /// main-actor 隔离限制，前者对 16.4 起的所有系统都稳。
-    /// 宿主控制器复用：每秒新建一个 VC + view 会把主线程拖出掉帧。
     private func renderBarImage() -> CGImage? {
         let metrics = self.metrics.isEmpty ? SettingsStore.shared.visibleMetrics : self.metrics
         let bar = FloatingBarView(
@@ -240,7 +302,7 @@ final class PiPBarHost: NSObject {
             fontSize: fontSize,
             useIcon: useIcon,
             backgroundOpacity: Double(backgroundOpacity),
-            useMaterial: false   // 离屏渲染没有 backdrop 可模糊，会出一层平灰，反而不像
+            useMaterial: false   // 离屏渲染没有 backdrop 可模糊，会出平灰
         )
 
         let host: UIHostingController<FloatingBarView>
@@ -250,15 +312,22 @@ final class PiPBarHost: NSObject {
         } else {
             host = UIHostingController(rootView: bar)
             host.view.backgroundColor = .clear
+            host.view.isOpaque = false
             renderHost = host
         }
         let size = host.sizeThatFits(in: CGSize(width: 4096, height: 4096))
         guard size.width > 1, size.height > 1 else { return nil }
 
-        // 缩放策略：等比放大到几乎占满画布（PiP 窗口本身很小，字必须够大才看得清）
-        let s = min(canvasWidth * 0.94 / size.width,
-                    canvasHeight * 0.72 / size.height,
-                    6.0)
+        // 画布比例跟浮条走：PiP 窗口就是一条浮条本身，而不是「浮条 + 黑边」。
+        // 只在首次（或字号大幅变化）时重算，避免视频尺寸每帧抖动。
+        let ratio = size.height / size.width
+        let want = max(72, min(360, (canvasWidth * ratio).rounded()))
+        if abs(want - canvasHeight) > 8 {
+            canvasHeight = want
+            NSLog("[QFSpeed] 画布调整为 %.0f×%.0f", canvasWidth, canvasHeight)
+        }
+
+        let s = canvasWidth / size.width
         if host.view.bounds.size != size {
             host.view.bounds = CGRect(origin: .zero, size: size)
             host.view.setNeedsLayout()
@@ -266,7 +335,7 @@ final class PiPBarHost: NSObject {
         }
 
         let format = UIGraphicsImageRendererFormat.default()
-        format.scale = 2
+        format.scale = 1
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: canvasWidth, height: canvasHeight),
                                                format: format)
@@ -322,10 +391,11 @@ final class PiPBarHost: NSObject {
                                                      imageBuffer: buffer,
                                                      formatDescriptionOut: &format)
         guard let format else { return }
+        guard layer.isReadyForMoreMediaData else { return }   // 队列没消化完就别塞
 
-        frameIndex += 1
-        let pts = CMTime(value: frameIndex, timescale: 1)
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 1),
+        frameCount += 1
+        let pts = CMTime(value: frameCount, timescale: 4)
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 4),
                                         presentationTimeStamp: pts,
                                         decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?
@@ -335,7 +405,6 @@ final class PiPBarHost: NSObject {
                                                  sampleTiming: &timing,
                                                  sampleBufferOut: &sample)
         guard let sample else { return }
-        // 直播语义：每帧立即显示，避免层等时间戳造成「卡住不动」
         CMSetAttachment(sample,
                         key: kCMSampleAttachmentKey_DisplayImmediately,
                         value: kCFBooleanTrue,
@@ -343,37 +412,49 @@ final class PiPBarHost: NSObject {
         layer.enqueue(sample)
     }
 
-    // MARK: - 保活音频
+    // MARK: - 保活音频（关键）
 
-    /// PiP 需要音频会话处于播放态，否则切到后台会被系统收掉。
-    /// 放一段自己生成的静音 WAV 循环（不引入资源文件，也不增加包体）。
-    private func startAudioKeepAlive() {
-        guard keepAlivePlayer == nil else { return }
+    /// 系统判断「可以画中画」的前提是内容在播放；对 sample buffer 层来说，
+    /// 唯一可靠的信号就是音频会话 active + 有音轨在跑。所以这里必须常开。
+    /// - Parameter allowMixing: 首次用可混音（不打断用户音乐）；
+    ///   重试时改成独占 —— 部分系统版本里可混音会话会被判成
+    ///   「没有主音频会话」而拒绝启动 PiP（这正是 2.1.6 踩到的坑）。
+    private func startAudioKeepAlive(allowMixing: Bool = true) {
         do {
-            // mixWithOthers 是必须的：不加就会把用户正在听的音乐顶掉。
-            // 混音下静音循环同样能让会话保持 active，够 PiP 续命。
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback,
-                                                           options: [.mixWithOthers])
-            try AVAudioSession.sharedInstance().setActive(true)
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback,
+                                    mode: .moviePlayback,
+                                    options: allowMixing ? [.mixWithOthers] : [])
+            try session.setActive(true)
+            audioActive = true
+        } catch {
+            audioActive = false
+            lastError = "音频会话失败：\(error.localizedDescription)"
+            NSLog("[QFSpeed] 音频会话失败 %@", String(describing: error))
+        }
+        if let p = keepAlivePlayer {
+            p.play()
+            return
+        }
+        do {
             let url = try Self.silentWavURL()
             let player = try AVAudioPlayer(contentsOf: url)
             player.numberOfLoops = -1
             player.volume = 0
+            player.prepareToPlay()
             player.play()
             keepAlivePlayer = player
         } catch {
-            lastError = "保活音频失败：\(error.localizedDescription)"
-            NSLog("[QFSpeed] 保活音频失败 %@", String(describing: error))
+            NSLog("[QFSpeed] 静音轨失败 %@", String(describing: error))
         }
     }
 
     private static func silentWavURL() throws -> URL {
-        let dir = FileManager.default.temporaryDirectory
-        let url = dir.appendingPathComponent("qfspeed-silence.wav")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("qfspeed-silence.wav")
         if FileManager.default.fileExists(atPath: url.path) { return url }
 
         let sampleRate = 8000
-        let frames = sampleRate          // 1 秒
+        let frames = sampleRate
         let dataBytes = frames * 2
         var d = Data()
         func le32(_ v: UInt32) { var x = v.littleEndian; withUnsafeBytes(of: &x) { d.append(contentsOf: $0) } }
@@ -398,40 +479,60 @@ final class PiPBarHost: NSObject {
 
 extension PiPBarHost: AVPictureInPictureControllerDelegate {
 
+    func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        NSLog("[QFSpeed] 画中画即将浮起")
+    }
+
     func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
         isRunning = true
         lastError = nil
+        startRetries = 0
         NSLog("[QFSpeed] 画中画已浮起（可拖到任意位置）")
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
         isRunning = false
-        keepAlivePlayer?.stop()
-        keepAlivePlayer = nil
-        NSLog("[QFSpeed] 画中画已收起")
+        // 两种「停止」要分开：用户在后台点 PiP 窗口的关闭键 = 真想关；
+        // 用户回到本 App 被系统自动收回 = 不能当成关闭，否则状态就假了。
+        let userClosed = UIApplication.shared.applicationState == .background
+        if userClosed {
+            stopRequested = true
+            NSLog("[QFSpeed] 用户关闭了画中画")
+        }
+        NSLog("[QFSpeed] 画中画已收起（userClosed=\(userClosed)）")
     }
 
     func pictureInPictureController(_ controller: AVPictureInPictureController,
                                     failedToStartPictureInPictureWithError error: Error) {
         let ns = error as NSError
-        // -1003 = PGPegasusErrorDomain：渲染层还没 ready，重试即可（2.1.6 同样处理）
-        if ns.code == -1003, startRetries < 3 {
+        isRunning = false
+        NSLog("[QFSpeed] 画中画启动失败 %@ %d %@", ns.domain, ns.code, ns.localizedDescription)
+        // AVSampleBufferDisplayLayer 源的已知毛病：首次 start 会失败，紧接着再试通常就成了。
+        // 重试时切到「独占」音频会话（见 startAudioKeepAlive 注释）。
+        if startRetries < 3 {
             startRetries += 1
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            startAudioKeepAlive(allowMixing: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
                 self?.start()
             }
             return
         }
-        lastError = "画中画启动失败 \(ns.code)"
-        NSLog("[QFSpeed] 画中画启动失败 %@", String(describing: ns))
+        lastError = "画中画启动失败 \(ns.domain) \(ns.code)"
+    }
+
+    func pictureInPictureController(_ controller: AVPictureInPictureController,
+                                    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
+        completionHandler(false)
     }
 }
 
 extension PiPBarHost: AVPictureInPictureSampleBufferPlaybackDelegate {
 
-    /// 直播语义：无限时长 —— 系统不给进度条，也不会自动暂停
     func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
-        CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+        // 无限时长 = 直播语义，系统不显示进度条、也不会自己暂停。
+        // 起点必须是 0 而不是 negativeInfinity —— 后者在部分系统版本上会让
+        // 控制器判定「时长非法」直接拒绝启动。
+        CMTimeRange(start: .zero, duration: .positiveInfinity)
     }
 
     func pictureInPictureControllerIsPlaybackPaused(_ controller: AVPictureInPictureController) -> Bool {

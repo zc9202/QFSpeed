@@ -569,6 +569,8 @@ final class FloatingWindowManager {
         rows.append(("运行形态", SpringBoardWindowHost.shared.wasInjected ? "SpringBoard 注入" : "独立 App"))
         // 常驻那一层是否真的准备好了（画中画）。这一行是排查「切出去条子就没了」的关键。
         rows.append(("常驻", PiPBarHost.shared.statusText))
+        // 把画中画每一步的判定都摊开：真机上不用连 Mac 看日志，一眼就知道卡在哪。
+        rows.append(contentsOf: PiPBarHost.shared.detailRows)
         return rows
     }
 }
